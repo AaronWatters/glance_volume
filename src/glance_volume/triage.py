@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+import json
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+
+class VolumeError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class _VolumeMetadata:
+    format_description: str
+    dataset: str | None
+    dtype: np.dtype[Any]
+    shape: tuple[int, ...]
+    scales: tuple[float, ...] | None
+
+
+def _numel(shape: tuple[int, ...]) -> int:
+    return int(np.prod(shape, dtype=np.int64))
+
+
+def _choose_largest(candidates: list[tuple[tuple[int, ...], np.dtype[Any], str | None, tuple[float, ...] | None]]) -> _VolumeMetadata:
+    valid = [item for item in candidates if len(item[0]) >= 3]
+    if not valid:
+        raise VolumeError("No volume data with ndim >= 3 was found.")
+    shape, dtype, dataset, scales = max(valid, key=lambda item: _numel(item[0]))
+    return _VolumeMetadata(
+        format_description="",
+        dataset=dataset,
+        dtype=np.dtype(dtype),
+        shape=shape,
+        scales=scales,
+    )
+
+
+def _npy_header(handle: Any) -> tuple[tuple[int, ...], np.dtype[Any]]:
+    version = np.lib.format.read_magic(handle)
+    if version == (1, 0):
+        shape, _, dtype = np.lib.format.read_array_header_1_0(handle)
+    elif version in {(2, 0), (3, 0)}:
+        shape, _, dtype = np.lib.format.read_array_header_2_0(handle)
+    elif hasattr(np.lib.format, "_read_array_header"):
+        shape, _, dtype = np.lib.format._read_array_header(handle, version)  # type: ignore[attr-defined]
+    else:
+        raise VolumeError(f"Unsupported npy version {version!r}.")
+    return tuple(int(i) for i in shape), np.dtype(dtype)
+
+
+def _from_npy(path: Path) -> _VolumeMetadata:
+    with path.open("rb") as handle:
+        shape, dtype = _npy_header(handle)
+    metadata = _choose_largest([(shape, dtype, None, None)])
+    return _VolumeMetadata(
+        format_description="NumPy .npy",
+        dataset=metadata.dataset,
+        dtype=metadata.dtype,
+        shape=metadata.shape,
+        scales=metadata.scales,
+    )
+
+
+def _from_npz(path: Path) -> _VolumeMetadata:
+    candidates: list[tuple[tuple[int, ...], np.dtype[Any], str | None, tuple[float, ...] | None]] = []
+    with zipfile.ZipFile(path, "r") as archive:
+        for name in archive.namelist():
+            if not name.endswith(".npy"):
+                continue
+            with archive.open(name, "r") as handle:
+                shape, dtype = _npy_header(handle)
+                candidates.append((shape, dtype, name.removesuffix(".npy"), None))
+    metadata = _choose_largest(candidates)
+    return _VolumeMetadata(
+        format_description="NumPy .npz",
+        dataset=metadata.dataset,
+        dtype=metadata.dtype,
+        shape=metadata.shape,
+        scales=metadata.scales,
+    )
+
+
+def _extract_ome_tiff_scales(ome_metadata: str | None, axes: str | None) -> tuple[float, ...] | None:
+    if not ome_metadata or not axes:
+        return None
+    try:
+        import tifffile
+
+        parsed = tifffile.xml2dict(ome_metadata)
+    except Exception:
+        return None
+
+    ome = parsed.get("OME")
+    if not isinstance(ome, dict):
+        return None
+    image = ome.get("Image")
+    if isinstance(image, list):
+        if len(image) != 1:
+            return None
+        image = image[0]
+    if not isinstance(image, dict):
+        return None
+    pixels = image.get("Pixels")
+    if not isinstance(pixels, dict):
+        return None
+
+    axis_sizes = {
+        "Z": pixels.get("PhysicalSizeZ"),
+        "Y": pixels.get("PhysicalSizeY"),
+        "X": pixels.get("PhysicalSizeX"),
+    }
+    if not all(axis_sizes.get(a) is not None for a in axes if a in {"Z", "Y", "X"}):
+        return None
+    result: list[float] = []
+    for axis in axes:
+        if axis in axis_sizes:
+            result.append(float(axis_sizes[axis]))
+        else:
+            return None
+    return tuple(result)
+
+
+def _from_tiff(path: Path) -> _VolumeMetadata:
+    import tifffile
+
+    candidates: list[tuple[tuple[int, ...], np.dtype[Any], str | None, tuple[float, ...] | None]] = []
+    with tifffile.TiffFile(path) as tif:
+        for index, series in enumerate(tif.series):
+            shape = tuple(int(i) for i in series.shape)
+            dtype = np.dtype(series.dtype)
+            axes = getattr(series, "axes", None)
+            scales = _extract_ome_tiff_scales(tif.ome_metadata, axes) if tif.is_ome else None
+            candidates.append((shape, dtype, f"series[{index}]", scales))
+        metadata = _choose_largest(candidates)
+        format_description = "OME-TIFF" if tif.is_ome else "TIFF"
+    return _VolumeMetadata(
+        format_description=format_description,
+        dataset=metadata.dataset,
+        dtype=metadata.dtype,
+        shape=metadata.shape,
+        scales=metadata.scales,
+    )
+
+
+def _extract_ome_zarr_scales(multiscales: Any, dataset_name: str | None) -> tuple[float, ...] | None:
+    if not dataset_name or not isinstance(multiscales, list) or len(multiscales) != 1:
+        return None
+    entry = multiscales[0]
+    if not isinstance(entry, dict):
+        return None
+    datasets = entry.get("datasets")
+    if not isinstance(datasets, list):
+        return None
+    for dataset in datasets:
+        if not isinstance(dataset, dict):
+            continue
+        if dataset.get("path") != dataset_name:
+            continue
+        transforms = dataset.get("coordinateTransformations")
+        if not isinstance(transforms, list):
+            continue
+        scales = [t for t in transforms if isinstance(t, dict) and t.get("type") == "scale"]
+        if len(scales) != 1:
+            return None
+        scale_values = scales[0].get("scale")
+        if not isinstance(scale_values, list):
+            return None
+        return tuple(float(v) for v in scale_values)
+    return None
+
+
+def _from_zarr(path: Path) -> _VolumeMetadata:
+    import zarr
+
+    root = zarr.open_group(str(path), mode="r")
+    candidates: list[tuple[tuple[int, ...], np.dtype[Any], str | None, tuple[float, ...] | None]] = []
+
+    for name, obj in root.members(max_depth=None):
+        if not isinstance(obj, zarr.Array):
+            continue
+        shape = tuple(int(i) for i in obj.shape)
+        dtype = np.dtype(obj.dtype)
+        candidates.append((shape, dtype, name, None))
+    metadata = _choose_largest(candidates)
+    scales = _extract_ome_zarr_scales(root.attrs.get("multiscales"), metadata.dataset)
+    return _VolumeMetadata(
+        format_description="OME-Zarr" if scales is not None else "Zarr",
+        dataset=metadata.dataset,
+        dtype=metadata.dtype,
+        shape=metadata.shape,
+        scales=scales,
+    )
+
+
+def _from_hdf5(path: Path) -> _VolumeMetadata:
+    import h5py
+
+    candidates: list[tuple[tuple[int, ...], np.dtype[Any], str | None, tuple[float, ...] | None]] = []
+    with h5py.File(path, "r") as handle:
+        def visit(name: str, obj: Any) -> None:
+            if not isinstance(obj, h5py.Dataset):
+                return
+            shape = tuple(int(i) for i in obj.shape)
+            dtype = np.dtype(obj.dtype)
+            candidates.append((shape, dtype, name, None))
+
+        handle.visititems(visit)
+    metadata = _choose_largest(candidates)
+    return _VolumeMetadata(
+        format_description="HDF5",
+        dataset=metadata.dataset,
+        dtype=metadata.dtype,
+        shape=metadata.shape,
+        scales=metadata.scales,
+    )
+
+
+class Volume:
+    def __init__(self, path: str | Path):
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(path)
+        self.path = str(path)
+
+        metadata: _VolumeMetadata
+        suffix = path.suffix.lower()
+        if suffix == ".npy":
+            metadata = _from_npy(path)
+        elif suffix == ".npz":
+            metadata = _from_npz(path)
+        elif suffix in {".tif", ".tiff"}:
+            metadata = _from_tiff(path)
+        elif suffix in {".h5", ".hdf5"}:
+            metadata = _from_hdf5(path)
+        elif path.is_dir():
+            metadata = _from_zarr(path)
+        else:
+            raise VolumeError(f"Unsupported file format for {path}.")
+
+        self.format_description = metadata.format_description
+        self.dataset = metadata.dataset
+        self.dtype = metadata.dtype
+        self.shape = metadata.shape
+        self.scales = metadata.scales
+
+    def json(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "format": self.format_description,
+            "dataset": self.dataset,
+            "dtype": str(self.dtype),
+            "shape": list(self.shape),
+            "scales": list(self.scales) if self.scales is not None else None,
+        }
+
+    def __repr__(self) -> str:
+        return json.dumps(self.json(), sort_keys=True)
