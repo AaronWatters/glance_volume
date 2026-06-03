@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import zipfile
 from dataclasses import dataclass
@@ -260,3 +261,14 @@ class Volume:
 
     def __repr__(self) -> str:
         return json.dumps(self.json(), sort_keys=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="volume-triage",
+        description="Print JSON metadata for a volume path.",
+    )
+    parser.add_argument("path", help="Path to the volume file or directory.")
+    args = parser.parse_args(argv)
+    print(json.dumps(Volume(args.path).json()))
+    return 0

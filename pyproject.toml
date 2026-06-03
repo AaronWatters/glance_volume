@@ -19,5 +19,8 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest"]
 
+[project.scripts]
+volume-triage = "glance_volume.triage:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

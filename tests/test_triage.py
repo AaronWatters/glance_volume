@@ -1,4 +1,5 @@
 import json
+import subprocess
 
 import h5py
 import numpy as np
@@ -104,3 +105,18 @@ def test_json_is_serializable(tmp_path):
     payload = Volume(path).json()
     encoded = json.dumps(payload)
     assert isinstance(encoded, str)
+
+
+def test_volume_triage_script(tmp_path):
+    path = tmp_path / "volume.npy"
+    np.save(path, np.zeros((2, 3, 4), dtype=np.uint8))
+    completed = subprocess.run(
+        ["volume-triage", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout)
+    assert payload["path"] == str(path)
+    assert payload["shape"] == [2, 3, 4]
+    assert payload["dtype"] == "uint8"
