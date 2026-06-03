@@ -1,0 +1,23 @@
+[build-system]
+requires = ["flit_core>=3.9,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "glance_volume"
+version = "0.1.0"
+description = "Analyse or view volume data."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Aaron Watters" }]
+dependencies = [
+    "numpy",
+    "tifffile",
+    "zarr",
+    "h5py",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
