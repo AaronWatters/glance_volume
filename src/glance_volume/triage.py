@@ -9,6 +9,16 @@ from typing import Any
 
 import numpy as np
 
+# Symbolic constants for format descriptions
+FORMAT_UNKNOWN = ""
+FORMAT_NUMPY_NPY = "NumPy .npy"
+FORMAT_NUMPY_NPZ = "NumPy .npz"
+FORMAT_OME_TIFF = "OME-TIFF"
+FORMAT_TIFF = "TIFF"
+FORMAT_OME_ZARR = "OME-Zarr"
+FORMAT_ZARR = "Zarr"
+FORMAT_HDF5 = "HDF5"
+
 
 class VolumeError(ValueError):
     pass
@@ -33,7 +43,7 @@ def _choose_largest(candidates: list[tuple[tuple[int, ...], np.dtype[Any], str |
         raise VolumeError("No volume data with ndim >= 3 was found.")
     shape, dtype, dataset, scales = max(valid, key=lambda item: _numel(item[0]))
     return _VolumeMetadata(
-        format_description="",
+        format_description=FORMAT_UNKNOWN,
         dataset=dataset,
         dtype=np.dtype(dtype),
         shape=shape,
@@ -59,7 +69,7 @@ def _from_npy(path: Path) -> _VolumeMetadata:
         shape, dtype = _npy_header(handle)
     metadata = _choose_largest([(shape, dtype, None, None)])
     return _VolumeMetadata(
-        format_description="NumPy .npy",
+        format_description=FORMAT_NUMPY_NPY,
         dataset=metadata.dataset,
         dtype=metadata.dtype,
         shape=metadata.shape,
@@ -78,7 +88,7 @@ def _from_npz(path: Path) -> _VolumeMetadata:
                 candidates.append((shape, dtype, name.removesuffix(".npy"), None))
     metadata = _choose_largest(candidates)
     return _VolumeMetadata(
-        format_description="NumPy .npz",
+        format_description=FORMAT_NUMPY_NPZ,
         dataset=metadata.dataset,
         dtype=metadata.dtype,
         shape=metadata.shape,
@@ -138,7 +148,7 @@ def _from_tiff(path: Path) -> _VolumeMetadata:
             scales = _extract_ome_tiff_scales(tif.ome_metadata, axes) if tif.is_ome else None
             candidates.append((shape, dtype, f"series[{index}]", scales))
         metadata = _choose_largest(candidates)
-        format_description = "OME-TIFF" if tif.is_ome else "TIFF"
+        format_description = FORMAT_OME_TIFF if tif.is_ome else FORMAT_TIFF
     return _VolumeMetadata(
         format_description=format_description,
         dataset=metadata.dataset,
@@ -181,16 +191,23 @@ def _from_zarr(path: Path) -> _VolumeMetadata:
     root = zarr.open_group(str(path), mode="r")
     candidates: list[tuple[tuple[int, ...], np.dtype[Any], str | None, tuple[float, ...] | None]] = []
 
-    for name, obj in root.members(max_depth=None):
-        if not isinstance(obj, zarr.Array):
-            continue
-        shape = tuple(int(i) for i in obj.shape)
-        dtype = np.dtype(obj.dtype)
-        candidates.append((shape, dtype, name, None))
+    if hasattr(root, "members"):
+        for name, obj in root.members(max_depth=None):
+            if not isinstance(obj, zarr.Array):
+                continue
+            shape = tuple(int(i) for i in obj.shape)
+            dtype = np.dtype(obj.dtype)
+            candidates.append((shape, dtype, name, None))
+    else:
+        # zarr 2.x compatibility: use arrays() iterator
+        for name, obj in root.arrays(recurse=True):
+            shape = tuple(int(i) for i in obj.shape)
+            dtype = np.dtype(obj.dtype)
+            candidates.append((shape, dtype, name, None))
     metadata = _choose_largest(candidates)
     scales = _extract_ome_zarr_scales(root.attrs.get("multiscales"), metadata.dataset)
     return _VolumeMetadata(
-        format_description="OME-Zarr" if scales is not None else "Zarr",
+        format_description=FORMAT_OME_ZARR if scales is not None else FORMAT_ZARR,
         dataset=metadata.dataset,
         dtype=metadata.dtype,
         shape=metadata.shape,
@@ -213,7 +230,7 @@ def _from_hdf5(path: Path) -> _VolumeMetadata:
         handle.visititems(visit)
     metadata = _choose_largest(candidates)
     return _VolumeMetadata(
-        format_description="HDF5",
+        format_description=FORMAT_HDF5,
         dataset=metadata.dataset,
         dtype=metadata.dtype,
         shape=metadata.shape,
@@ -248,6 +265,84 @@ class Volume:
         self.dtype = metadata.dtype
         self.shape = metadata.shape
         self.scales = metadata.scales
+        self._array: np.ndarray | None = None
+
+    @property
+    def array(self) -> np.ndarray:
+        """Return the volume array, reading and caching it on first access."""
+        if self._array is not None:
+            return self._array
+
+        path = Path(self.path)
+        fmt = self.format_description
+
+        if fmt == FORMAT_NUMPY_NPY:
+            arr = np.load(path)
+        elif fmt == FORMAT_NUMPY_NPZ:
+            npz = np.load(path)
+            if self.dataset and self.dataset in npz:
+                arr = npz[self.dataset]
+            elif len(npz.files) == 1:
+                arr = npz[npz.files[0]]
+            else:
+                raise VolumeError(f"Cannot determine dataset in {path}")
+        elif fmt in {FORMAT_OME_TIFF, FORMAT_TIFF}:
+            try:
+                import tifffile
+
+                with tifffile.TiffFile(path) as tif:
+                    if self.dataset and self.dataset.startswith("series[") and self.dataset.endswith("]"):
+                        index = int(self.dataset[len("series["):-1])
+                    else:
+                        index = 0
+                    series = tif.series[index]
+                    arr = series.asarray()
+            except Exception as exc:  # pragma: no cover - platform-specific tifffile errors
+                raise VolumeError(f"Error reading TIFF: {exc}")
+        elif fmt == FORMAT_HDF5:
+            try:
+                import h5py
+
+                with h5py.File(path, "r") as handle:
+                    if not self.dataset:
+                        raise VolumeError("HDF5 dataset name unknown")
+                    arr = handle[self.dataset][()]
+            except Exception as exc:  # pragma: no cover - h5py I/O errors
+                raise VolumeError(f"Error reading HDF5: {exc}")
+        elif fmt in {FORMAT_OME_ZARR, FORMAT_ZARR}:
+            try:
+                import zarr
+
+                root = zarr.open_group(str(path), mode="r")
+                if self.dataset and self.dataset in root:
+                    arr = root[self.dataset][...]
+                else:
+                    # try to find the first array member
+                    found = None
+                    for name, obj in root.members(max_depth=None):
+                        try:
+                            import zarr as _z
+
+                            if isinstance(obj, _z.Array):
+                                found = name
+                                break
+                        except Exception:
+                            continue
+                    if found is None:
+                        raise VolumeError(f"No array found in Zarr at {path}")
+                    arr = root[found][...]
+            except Exception as exc:  # pragma: no cover - zarr I/O errors
+                raise VolumeError(f"Error reading Zarr: {exc}")
+        else:
+            # fallback to suffix-based behavior for unknown formats
+            suffix = path.suffix.lower()
+            if suffix == ".npy":
+                arr = np.load(path)
+            else:
+                raise VolumeError(f"Unsupported file format for reading array: {path}")
+
+        self._array = np.asarray(arr)
+        return self._array
 
     def json(self) -> dict[str, Any]:
         return {
@@ -270,5 +365,5 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("path", help="Path to the volume file or directory.")
     args = parser.parse_args(argv)
-    print(json.dumps(Volume(args.path).json()), indent=2, sort_keys=True)
+    print(json.dumps(Volume(args.path).json(), indent=2, sort_keys=True))
     return 0

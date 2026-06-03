@@ -63,7 +63,8 @@ def test_ome_tiff_scales(tmp_path):
 def test_ome_zarr_scales(tmp_path):
     path = tmp_path / "ome.zarr"
     root = zarr.open_group(str(path), mode="w")
-    root.create_array("0", data=np.zeros((2, 3, 4), dtype=np.uint8))
+    # Use create_dataset for compatibility with installed zarr versions
+    root.create_dataset("0", data=np.zeros((2, 3, 4), dtype=np.uint8))
     root.attrs["multiscales"] = [
         {
             "datasets": [
