@@ -270,5 +270,5 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("path", help="Path to the volume file or directory.")
     args = parser.parse_args(argv)
-    print(json.dumps(Volume(args.path).json()))
+    print(json.dumps(Volume(args.path).json()), indent=2, sort_keys=True)
     return 0
