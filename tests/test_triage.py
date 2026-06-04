@@ -33,6 +33,18 @@ def test_npz_selects_largest_3d_array(tmp_path):
     assert str(volume.dtype) == "int16"
 
 
+def test_npz_query_overrides_scales(tmp_path):
+    path = tmp_path / "labels_and_image.npz"
+    np.savez(
+        path,
+        labels=np.zeros((2, 3, 4), dtype=np.uint8),
+        image=np.zeros((2, 3, 4), dtype=np.uint8),
+    )
+    volume = Volume(f"{path}?z=13&y=2")
+    assert volume.dataset == "labels"
+    assert volume.scales == (13.0, 2.0, 1.0)
+
+
 def test_tiff_volume(tmp_path):
     path = tmp_path / "volume.tiff"
     tifffile.imwrite(path, np.zeros((2, 3, 4), dtype=np.uint8))
@@ -58,6 +70,58 @@ def test_ome_tiff_scales(tmp_path):
     assert volume.format_description == "OME-TIFF"
     assert volume.shape == (2, 3, 5)
     assert volume.scales == (2.0, 0.5, 0.25)
+
+
+def test_volume_path_query_overrides_scales(tmp_path):
+    path = tmp_path / "queried_ome.tiff"
+    tifffile.imwrite(
+        path,
+        np.zeros((2, 3, 5), dtype=np.uint8),
+        ome=True,
+        metadata={
+            "axes": "ZYX",
+            "PhysicalSizeZ": 2.0,
+            "PhysicalSizeY": 0.5,
+            "PhysicalSizeX": 0.25,
+        },
+    )
+    volume = Volume(f"{path}?z=10&y=2&x=0.5")
+    assert volume.path == str(path)
+    assert volume.scales == (10.0, 2.0, 0.5)
+
+
+def test_volume_path_query_allows_partial_xyz_overrides(tmp_path):
+    path = tmp_path / "queried_ome_missing_x.tiff"
+    tifffile.imwrite(
+        path,
+        np.zeros((2, 3, 5), dtype=np.uint8),
+        ome=True,
+        metadata={
+            "axes": "ZYX",
+            "PhysicalSizeZ": 2.0,
+            "PhysicalSizeY": 0.5,
+            "PhysicalSizeX": 0.25,
+        },
+    )
+    volume = Volume(f"{path}?z=10&y=2")
+    assert volume.scales == (10.0, 2.0, 0.25)
+
+
+def test_volume_path_query_allows_single_axis_override(tmp_path):
+    path = tmp_path / "queried_ome_x_only.tiff"
+    tifffile.imwrite(
+        path,
+        np.zeros((2, 3, 5), dtype=np.uint8),
+        ome=True,
+        metadata={
+            "axes": "ZYX",
+            "PhysicalSizeZ": 2.0,
+            "PhysicalSizeY": 0.5,
+            "PhysicalSizeX": 0.25,
+        },
+    )
+    volume = Volume(f"{path}?x=0.5")
+    assert volume.scales == (2.0, 0.5, 0.5)
 
 
 def test_ome_zarr_scales(tmp_path):

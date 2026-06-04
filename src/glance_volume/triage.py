@@ -4,8 +4,10 @@ import argparse
 import json
 import zipfile
 from dataclasses import dataclass
+from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 from typing import Any
+import neuroglancer
 
 import numpy as np
 
@@ -18,7 +20,7 @@ FORMAT_TIFF = "TIFF"
 FORMAT_OME_ZARR = "OME-Zarr"
 FORMAT_ZARR = "Zarr"
 FORMAT_HDF5 = "HDF5"
-
+DIMENSION_NAMES = ["z", "y", "x"]
 
 class VolumeError(ValueError):
     pass
@@ -49,6 +51,31 @@ def _choose_largest(candidates: list[tuple[tuple[int, ...], np.dtype[Any], str |
         shape=shape,
         scales=scales,
     )
+
+
+def _split_volume_path(path: str | Path) -> tuple[Path, tuple[float | None, float | None, float | None] | None]:
+    path_text = str(path)
+    parsed = urlsplit(path_text)
+    actual_path = Path(parsed.path or path_text)
+    if not parsed.query:
+        return actual_path, None
+
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    if not any(name in params for name in ("x", "y", "z")):
+        return actual_path, None
+
+    overrides_list: list[float | None] = []
+    for name in ("z", "y", "x"):
+        value = params.get(name)
+        if not value:
+            overrides_list.append(None)
+            continue
+        try:
+            overrides_list.append(float(value[0]))
+        except (TypeError, ValueError, IndexError) as exc:
+            raise VolumeError(f"Invalid scale override in volume path: {path_text}") from exc
+    overrides = tuple(overrides_list)
+    return actual_path, overrides
 
 
 def _npy_header(handle: Any) -> tuple[tuple[int, ...], np.dtype[Any]]:
@@ -240,7 +267,7 @@ def _from_hdf5(path: Path) -> _VolumeMetadata:
 
 class Volume:
     def __init__(self, path: str | Path):
-        path = Path(path)
+        path, scale_overrides = _split_volume_path(path)
         if not path.exists():
             raise FileNotFoundError(path)
         self.path = str(path)
@@ -259,6 +286,22 @@ class Volume:
             metadata = _from_zarr(path)
         else:
             raise VolumeError(f"Unsupported file format for {path}.")
+        
+        if scale_overrides is not None:
+            mscales = metadata.scales if metadata.scales is not None else (1.0,) * len(metadata.shape)
+            if len(mscales) < 3:
+                raise VolumeError("Scale overrides require a volume with at least 3 dimensions.")
+            scales = list(mscales)
+            for index, override in enumerate(scale_overrides):
+                if override is not None:
+                    scales[index] = override
+            metadata = _VolumeMetadata(
+                format_description=metadata.format_description,
+                dataset=metadata.dataset,
+                dtype=metadata.dtype,
+                shape=metadata.shape,
+                scales=tuple(scales),
+            )
 
         self.format_description = metadata.format_description
         self.dataset = metadata.dataset
@@ -353,6 +396,22 @@ class Volume:
             "shape": list(self.shape),
             "scales": list(self.scales) if self.scales is not None else None,
         }
+    
+    def neuroglancer_layer(self, scales=None) -> neuroglancer.Layer:
+        if scales is None:
+            scales = self.scales
+        dimensionscale = [1,1,1]
+        if scales is not None and len(scales) != len(self.shape):
+            raise ValueError("Scales length must match shape length.")
+            dimensionscale = list(scales)
+        dimensions = neuroglancer.CoordinateSpace(
+            names=DIMENSION_NAMES[:],
+            units="nm", 
+            scales=dimensionscale)
+        return neuroglancer.LocalVolume(
+            data=self.array,
+            dimensions=dimensions,
+        )
 
     def __repr__(self) -> str:
         return json.dumps(self.json(), sort_keys=True)

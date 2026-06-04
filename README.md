@@ -8,7 +8,10 @@ inputs.
 # Scripts
 
 ```bash
-$ volume-triage PATH # Print volume metadata from PATH as JSON.
+$ # Print volume metadata from PATH as JSON.
+$ volume-triage PATH
+$ # Example path notation, providing scaling (x implicitly 1).
+$ volume-triage labels_and_image.npz?z=13\&y=2
 ```
 
 # Development install
