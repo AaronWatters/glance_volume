@@ -5,6 +5,11 @@ Analyse or view volume data.
 scales when unambiguous) for `.npy`, `.npz`, TIFF/OME-TIFF, OME-Zarr, and HDF5
 inputs.
 
+# Scripts
+
+```bash
+$ volume-triage PATH # Print volume metadata from PATH as JSON.
+```
 
 # Development install
 
