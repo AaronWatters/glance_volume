@@ -23,6 +23,7 @@ test = ["pytest"]
 
 [project.scripts]
 volume-triage = "glance_volume.triage:main"
+volume-glance = "glance_volume.glance:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

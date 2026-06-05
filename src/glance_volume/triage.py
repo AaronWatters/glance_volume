@@ -266,7 +266,8 @@ def _from_hdf5(path: Path) -> _VolumeMetadata:
 
 
 class Volume:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, verbose: bool = False):
+        self.verbose = verbose
         path, scale_overrides = _split_volume_path(path)
         if not path.exists():
             raise FileNotFoundError(path)
@@ -318,6 +319,10 @@ class Volume:
 
         path = Path(self.path)
         fmt = self.format_description
+
+        if self.verbose:
+            print("Reading volume")
+            print(json.dumps(self.json(), indent=2, sort_keys=True))
 
         if fmt == FORMAT_NUMPY_NPY:
             arr = np.load(path)
@@ -397,13 +402,15 @@ class Volume:
             "scales": list(self.scales) if self.scales is not None else None,
         }
     
-    def neuroglancer_layer(self, scales=None) -> neuroglancer.Layer:
+    def neuroglancer_volume(self, scales=None) -> neuroglancer.LocalVolume:
         if scales is None:
             scales = self.scales
         dimensionscale = [1,1,1]
         if scales is not None and len(scales) != len(self.shape):
             raise ValueError("Scales length must match shape length.")
+        if scales is not None:
             dimensionscale = list(scales)
+        print("creating neuroglancer volume with scales:", dimensionscale)
         dimensions = neuroglancer.CoordinateSpace(
             names=DIMENSION_NAMES[:],
             units="nm", 
@@ -412,10 +419,39 @@ class Volume:
             data=self.array,
             dimensions=dimensions,
         )
+    
+    def neuroglancer_image_layer(self, scales=None, color="white") -> neuroglancer.ImageLayer:
+        image = self.array
+        p1, p99 = np.percentile(image, [1, 99])
+        shader = neuroglancer_colored_shader(color, p1, p99)
+        result = neuroglancer.ImageLayer(
+            source=self.neuroglancer_volume(scales),
+            shader=shader,
+        )
+        return result
+    
+    def neuroglancer_segmentation_layer(self, scales=None, hexcolors=None) -> neuroglancer.SegmentationLayer:
+        result = neuroglancer.SegmentationLayer(
+            source=self.neuroglancer_volume(scales),
+        )
+        if hexcolors is not None:
+            result.segment_colors.update(hexcolors)
+        return result
 
     def __repr__(self) -> str:
         return json.dumps(self.json(), sort_keys=True)
+    
+def neuroglancer_colored_shader(color: str, min_value: float = 0.0, max_value: float = 1.0) -> str:
+    return NEUROGLANCER_COLORED_GLSL % (float(min_value), float(max_value), color)
 
+NEUROGLANCER_COLORED_GLSL = """
+#uicontrol invlerp normalized(range=[%s, %s])
+#uicontrol vec3 color color(default="%s")
+
+void main() {
+    emitRGB(color * normalized());
+}
+"""
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
