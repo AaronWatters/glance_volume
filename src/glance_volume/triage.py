@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 from typing import Any
 import neuroglancer
+from array_gizmos.operations3d import positive_slicing, slice3
 
 import numpy as np
 
@@ -310,6 +311,8 @@ class Volume:
         self.shape = metadata.shape
         self.scales = metadata.scales
         self._array: np.ndarray | None = None
+        self.layer: neuroglancer.ImageLayer | neuroglancer.SegmentationLayer | None = None
+        self.color: str = "white"
 
     @property
     def array(self) -> np.ndarray:
@@ -421,6 +424,8 @@ class Volume:
         )
     
     def neuroglancer_image_layer(self, scales=None, color="white") -> neuroglancer.ImageLayer:
+        if self.layer is not None:
+            raise ValueError("This volume has already been converted to a neuroglancer layer.")
         image = self.array
         p1, p99 = np.percentile(image, [1, 99])
         shader = neuroglancer_colored_shader(color, p1, p99)
@@ -428,14 +433,44 @@ class Volume:
             source=self.neuroglancer_volume(scales),
             shader=shader,
         )
+        self.color = color
+        self.layer = result
         return result
     
+    def set_layer_to_sliced_range(self, other: Volume):
+        if self.layer is None:
+            raise ValueError("This volume has not been converted to a neuroglancer layer yet.")
+        if self.layer is None:
+            self.neuroglancer_image_layer()
+        min_value, max_value = self.sliced_range(other)
+        print (f"setting layer shader with sliced range: {min_value} - {max_value}")
+        shader = neuroglancer_colored_shader(self.color, min_value, max_value)
+        self.layer.shader = shader
+    
+    def labels(self) -> set[int]:
+        if not np.issubdtype(self.dtype, np.integer):
+            raise ValueError("Cannot extract labels from non-integer volume.")
+        values = np.unique(self.array)
+        return set(int(x) for x in values if x != 0)
+    
+    def sliced_range(self, other: Volume) -> (number, number):
+        other_array = other.array
+        slicing = positive_slicing(other_array)
+        sliced = slice3(self.array, slicing)
+        return np.min(sliced), np.max(sliced)
+    
+    def full_range(self) -> (number, number):
+        return np.min(self.array), np.max(self.array)
+    
     def neuroglancer_segmentation_layer(self, scales=None, hexcolors=None) -> neuroglancer.SegmentationLayer:
+        if self.layer is not None:
+            raise ValueError("This volume has already been converted to a neuroglancer layer.")
         result = neuroglancer.SegmentationLayer(
             source=self.neuroglancer_volume(scales),
         )
         if hexcolors is not None:
             result.segment_colors.update(hexcolors)
+        self.layer = result
         return result
 
     def __repr__(self) -> str:

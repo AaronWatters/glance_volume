@@ -15,6 +15,7 @@ dependencies = [
     "zarr",
     "h5py",
     "h5gizmos",
+    "array_gizmos",
     "neuroglancer",
 ]
 
